@@ -155,13 +155,34 @@ func (h *HttpServer) txHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	txHash, err := h.rpc.SendRawTransaction(tx, false)
+	responseBytes, err := h.rpc.RawRequest("sendrawtransaction", []json.RawMessage{json.RawMessage([]byte(fmt.Sprintf("\"%s\"", txs.RawTx))), json.RawMessage([]byte("0"))})
 	if err != nil {
 		logging.Warnf("Transaction rejected by Core: %s", err.Error())
 		http.Error(w, "Transaction rejected", 500)
 		return
 	}
 
+	var response interface{}
+	err = json.Unmarshal(responseBytes, &response)
+	if err != nil {
+		logging.Warnf("Could not parse Core response to sendrawtransaction: %s", err.Error())
+		http.Error(w, "Internal Server Error - Transaction might have gone through", 500)
+		return
+	}
+
+	txHashStr, ok := response.(string)
+	if !ok {
+		logging.Warnf("Could not parse Core response to sendrawtransaction: %s", err.Error())
+		http.Error(w, "Internal Server Error - Transaction might have gone through", 500)
+		return
+	}
+
+	txHash, err := chainhash.NewHashFromStr(txHashStr)
+	if err != nil {
+		logging.Warnf("Unable to parse response [%s] into a TX Hash: %s", string(txHashStr), err.Error())
+		http.Error(w, "Transaction rejected", 500)
+		return
+	}
 	// Now the transaction is accepted, create a preliminary transaction without a block_id
 	// and make the inputs spent by that. Then the balances immediately reflect the spend.
 	// Outputs will be created once the block comes in that confirms the transaction
@@ -231,7 +252,7 @@ func (h *HttpServer) utxosHandler(w http.ResponseWriter, r *http.Request) {
 
 	result := make([]Utxo, 0)
 	if scriptID != -1 {
-		rows, err := h.db.Query("select t.hash, o.vout, o.value from outputs o left join transactions t on t.id=o.created_in_tx left join blocks b on b.id=t.block_id where script_id=$1 AND (coinbase=false or b.height <= (select height-101 from blocks order by height desc limit 1))", scriptID)
+		rows, err := h.db.Query("select t.hash, o.vout, o.value from outputs o left join transactions t on t.id=o.created_in_tx left join blocks b on b.id=t.block_id where script_id=$1 AND (coinbase=false or b.height <= (select height-101 from blocks order by height desc limit 1)) AND spent_in_tx IS NULL", scriptID)
 		if err != nil {
 			logging.Errorf("Error querying utxos: %v", err)
 			http.Error(w, "Internal server error", 500)
