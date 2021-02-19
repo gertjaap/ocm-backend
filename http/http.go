@@ -1,6 +1,7 @@
 package http
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/rpcclient"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/gertjaap/ocm-backend/logging"
 	"github.com/gertjaap/ocm-backend/processor"
 	"github.com/gorilla/mux"
@@ -18,12 +21,13 @@ import (
 
 type HttpServer struct {
 	srv           *http.Server
+	rpc           *rpcclient.Client
 	db            *sql.DB
 	proc          *processor.Processor
 	responseTimes map[string]*ratecounter.AvgRateCounter
 }
 
-func NewHttpServer(db *sql.DB, p *processor.Processor) *HttpServer {
+func NewHttpServer(rpc *rpcclient.Client, db *sql.DB, p *processor.Processor) *HttpServer {
 	h := new(HttpServer)
 
 	r := mux.NewRouter()
@@ -31,6 +35,7 @@ func NewHttpServer(db *sql.DB, p *processor.Processor) *HttpServer {
 	r.HandleFunc("/health", h.healthHandler)
 	r.HandleFunc("/balance/{script}", h.balanceHandler)
 	r.HandleFunc("/utxos/{script}", h.utxosHandler)
+	r.HandleFunc("/tx", h.txHandler).Methods("POST")
 
 	h.srv = &http.Server{
 		Handler: r,
@@ -40,6 +45,7 @@ func NewHttpServer(db *sql.DB, p *processor.Processor) *HttpServer {
 		ReadTimeout:  15 * time.Second,
 	}
 	h.db = db
+	h.rpc = rpc
 	h.proc = p
 	h.responseTimes = map[string]*ratecounter.AvgRateCounter{
 		"info":    ratecounter.NewAvgRateCounter(15 * time.Minute),
@@ -125,6 +131,82 @@ type Utxo struct {
 	TxID   string `json:"txid"`
 	Vout   int64  `json:"vout"`
 	Amount int64  `json:"satoshis"`
+}
+
+type txSend struct {
+	RawTx string `json:"rawtx"`
+}
+
+func (h *HttpServer) txHandler(w http.ResponseWriter, r *http.Request) {
+	var txs txSend
+	json.NewDecoder(r.Body).Decode(&txs)
+
+	txBytes, err := hex.DecodeString(txs.RawTx)
+	if err != nil {
+		logging.Warnf("Received invalid transaction hex: %s", err.Error())
+		http.Error(w, "Request invalid", 500)
+		return
+	}
+	tx := wire.NewMsgTx(2)
+	err = tx.Deserialize(bytes.NewReader(txBytes))
+	if err != nil {
+		logging.Warnf("Received invalid transaction: %s", err.Error())
+		http.Error(w, "Request invalid", 500)
+		return
+	}
+
+	txHash, err := h.rpc.SendRawTransaction(tx, false)
+	if err != nil {
+		logging.Warnf("Transaction rejected by Core: %s", err.Error())
+		http.Error(w, "Transaction rejected", 500)
+		return
+	}
+
+	// Now the transaction is accepted, create a preliminary transaction without a block_id
+	// and make the inputs spent by that. Then the balances immediately reflect the spend.
+	// Outputs will be created once the block comes in that confirms the transaction
+	trx, err := h.db.Begin()
+	if err != nil {
+		logging.Errorf("Error creating transaction: %s", err.Error())
+		http.Error(w, "Internal Server Error", 500)
+		return
+	}
+	var transID int64
+	err = trx.QueryRow("INSERT INTO transactions(hash, received) VALUES ($1, NOW()) RETURNING id", txHash.CloneBytes()).Scan(&transID)
+	if err != nil {
+		logging.Errorf("Error inserting transaction: %s", err.Error())
+		http.Error(w, "Internal Server Error", 500)
+		return
+	}
+
+	transactionsSpentInBlock := make([]*chainhash.Hash, 0)
+	for _, i := range tx.TxIn {
+		transactionsSpentInBlock = append(transactionsSpentInBlock, &i.PreviousOutPoint.Hash)
+	}
+	txIDs, err := h.proc.QueryTransactionIDs(trx, transactionsSpentInBlock)
+	if err != nil {
+		logging.Errorf("Error getting spent transaction IDs: %s", err.Error())
+		http.Error(w, "Internal Server Error", 500)
+		return
+	}
+
+	err = h.proc.MarkOutputsSpent(trx, transID, tx, txIDs)
+	if err != nil {
+		logging.Errorf("Error marking outputs as spent: %s", err.Error())
+		http.Error(w, "Internal Server Error", 500)
+		return
+	}
+
+	err = trx.Commit()
+	if err != nil {
+		logging.Errorf("Error committing to database: %s", err.Error())
+		http.Error(w, "Internal Server Error", 500)
+		return
+	}
+
+	writeJson(w, map[string]interface{}{
+		"txid": txHash.String(),
+	})
 }
 
 func (h *HttpServer) utxosHandler(w http.ResponseWriter, r *http.Request) {

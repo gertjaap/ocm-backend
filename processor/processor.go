@@ -127,17 +127,17 @@ func (p *Processor) ProcessLoop() {
 			// Start batch
 			tx, err := p.db.Begin()
 
-			var blockId int64
+			var blockID int64
 			bh := blk.BlockHash()
 
-			err = tx.QueryRow("INSERT INTO blocks(hash, height) VALUES ($1,$2) RETURNING id", (&bh).CloneBytes(), height+1).Scan(&blockId)
+			err = tx.QueryRow("INSERT INTO blocks(hash, height) VALUES ($1,$2) RETURNING id", (&bh).CloneBytes(), height+1).Scan(&blockID)
 			if err != nil {
 				logging.Warnf("Unable to insert block: %v", err)
 				return
 			}
 
 			start = time.Now()
-			txIDs, err := p.GetTransactionIDsForBlock(tx, blk)
+			txIDs, err := p.GetTransactionIDsForBlock(tx, blockID, blk)
 			if err != nil {
 				logging.Warnf("Unable to query txids for block: %v", height+1, err)
 				return
@@ -154,7 +154,7 @@ func (p *Processor) ProcessLoop() {
 
 			for i, t := range blk.Transactions {
 				start = time.Now()
-				err = p.processTransaction(tx, blockId, i, txIDs, scriptIDs, t)
+				err = p.processTransaction(tx, blockID, i, txIDs, scriptIDs, t)
 				logging.Debugf("Process TX: %d us", time.Now().Sub(start).Microseconds())
 				if err != nil {
 					logging.Warnf("Unable to process transaction %v: %v", t.TxHash(), err)
@@ -199,6 +199,47 @@ func (p *Processor) processTransaction(trx *sql.Tx, blockID int64, seq int, txID
 		return errors.New("Transaction ID was not inserted")
 	}
 
+	err := p.MarkOutputsSpent(trx, transID, tx, txIDs)
+	if err != nil {
+		return err
+	}
+
+	return p.CreateOutputs(trx, transID, tx, scriptIDs)
+}
+
+func (p *Processor) CreateOutputs(trx *sql.Tx, transID int64, tx *wire.MsgTx, scriptIDs map[string]int64) error {
+	var sqlParamBuf bytes.Buffer
+	sqlParams := make([]interface{}, 0)
+	sql := "INSERT INTO outputs(script_id, created_in_tx, vout, value, coinbase) VALUES %s ON CONFLICT (created_in_tx, vout) DO NOTHING"
+	for idx, o := range tx.TxOut {
+		scriptID, ok := scriptIDs[hex.EncodeToString(o.PkScript)]
+		if !ok {
+			panic("Did not find script in built array - this should never happen")
+		}
+		if idx > 0 {
+			io.WriteString(&sqlParamBuf, ",")
+		}
+		io.WriteString(&sqlParamBuf, "(")
+		for c := 1; c <= 5; c++ {
+			if c > 1 {
+				io.WriteString(&sqlParamBuf, ",")
+			}
+			io.WriteString(&sqlParamBuf, fmt.Sprintf("$%d", (idx*5)+c))
+		}
+		io.WriteString(&sqlParamBuf, ")")
+		isCoinbase := p.IsCoinbase(tx)
+		sqlParams = append(sqlParams, scriptID, transID, idx, o.Value, isCoinbase)
+	}
+	start := time.Now()
+	_, err := trx.Exec(fmt.Sprintf(sql, string(sqlParamBuf.Bytes())), sqlParams...)
+	if err != nil {
+		return fmt.Errorf("Error inserting outputs: %v", err)
+	}
+	logging.Debugf("Insert outputs: %d us", time.Now().Sub(start).Microseconds())
+	return nil
+}
+
+func (p *Processor) MarkOutputsSpent(trx *sql.Tx, transID int64, tx *wire.MsgTx, txIDs map[string]int64) error {
 	var sqlParamBuf bytes.Buffer
 	sqlParams := []interface{}{transID}
 	sql := "UPDATE outputs SET spent_in_tx=$1 WHERE (created_in_tx,vout) IN (%s)"
@@ -223,37 +264,7 @@ func (p *Processor) processTransaction(trx *sql.Tx, blockID int64, seq int, txID
 		return fmt.Errorf("Error updating spent outputs: %v", err)
 	}
 	logging.Debugf("Update spent outputs: %d us", time.Now().Sub(start).Microseconds())
-
-	sqlParamBuf.Reset()
-	sqlParams = make([]interface{}, 0)
-	sql = "INSERT INTO outputs(script_id, created_in_tx, vout, value, coinbase) VALUES %s ON CONFLICT (created_in_tx, vout) DO NOTHING"
-	for idx, o := range tx.TxOut {
-		scriptID, ok := scriptIDs[hex.EncodeToString(o.PkScript)]
-		if !ok {
-			panic("Did not find script in built array - this should never happen")
-		}
-		if idx > 0 {
-			io.WriteString(&sqlParamBuf, ",")
-		}
-		io.WriteString(&sqlParamBuf, "(")
-		for c := 1; c <= 5; c++ {
-			if c > 1 {
-				io.WriteString(&sqlParamBuf, ",")
-			}
-			io.WriteString(&sqlParamBuf, fmt.Sprintf("$%d", (idx*5)+c))
-		}
-		io.WriteString(&sqlParamBuf, ")")
-		isCoinbase := p.IsCoinbase(tx)
-		sqlParams = append(sqlParams, scriptID, transID, idx, o.Value, isCoinbase)
-	}
-	start = time.Now()
-	_, err = trx.Exec(fmt.Sprintf(sql, string(sqlParamBuf.Bytes())), sqlParams...)
-	if err != nil {
-		return fmt.Errorf("Error inserting outputs: %v", err)
-	}
-	logging.Debugf("Insert outputs: %d us", time.Now().Sub(start).Microseconds())
-
-	return err
+	return nil
 }
 
 func (p *Processor) GetScriptIDsForBlock(trx *sql.Tx, blk *wire.MsgBlock) (map[string]int64, error) {
@@ -297,38 +308,78 @@ func (p *Processor) GetScriptIDsForBlock(trx *sql.Tx, blk *wire.MsgBlock) (map[s
 	return result, nil
 }
 
-func (p *Processor) GetTransactionIDsForBlock(trx *sql.Tx, blk *wire.MsgBlock) (map[string]int64, error) {
-	result := map[string]int64{}
-	var sqlParamBuf bytes.Buffer
-	var sqlParamBuf2 bytes.Buffer
-	sqlParams := make([]interface{}, 0)
-	sql := "INSERT INTO transactions(hash) VALUES %s ON CONFLICT(hash) DO NOTHING"
-	sql2 := "SELECT id, hash FROM transactions WHERE hash in (%s)"
-	idx := 0
+func (p *Processor) GetTransactionIDsForBlock(trx *sql.Tx, blockID int64, blk *wire.MsgBlock) (map[string]int64, error) {
+	transactionsCreatedInBlock := make([]*chainhash.Hash, 0)
+	transactionsSpentInBlock := make([]*chainhash.Hash, 0)
 	for _, tx := range blk.Transactions {
 		for _, i := range tx.TxIn {
-			idx++
-			if idx > 1 {
-				io.WriteString(&sqlParamBuf, ",")
-				io.WriteString(&sqlParamBuf2, ",")
-			}
-			io.WriteString(&sqlParamBuf, fmt.Sprintf("($%d)", idx))
-			io.WriteString(&sqlParamBuf2, fmt.Sprintf("$%d", idx))
-			sqlParams = append(sqlParams, (&i.PreviousOutPoint.Hash).CloneBytes())
+			transactionsSpentInBlock = append(transactionsSpentInBlock, &i.PreviousOutPoint.Hash)
 		}
-		idx++
-		io.WriteString(&sqlParamBuf, fmt.Sprintf(",($%d)", idx))
-		io.WriteString(&sqlParamBuf2, fmt.Sprintf(",$%d", idx))
 		txHash := tx.TxHash()
-		sqlParams = append(sqlParams, (&txHash).CloneBytes())
+		transactionsCreatedInBlock = append(transactionsCreatedInBlock, &txHash)
+	}
+	err := p.EnsureTransactionsInserted(trx, append(transactionsCreatedInBlock, transactionsSpentInBlock...))
+	if err != nil {
+		return map[string]int64{}, fmt.Errorf("Error occured during EnsureTransactionsInserted: %v", err)
+	}
+	err = p.SetBlockIDForTransactions(trx, blockID, transactionsCreatedInBlock)
+	if err != nil {
+		return map[string]int64{}, fmt.Errorf("Error occured during SetBlockIDForTransactions: %v", err)
+	}
+
+	results, err := p.QueryTransactionIDs(trx, append(transactionsCreatedInBlock, transactionsSpentInBlock...))
+	if err != nil {
+		return map[string]int64{}, fmt.Errorf("Error occured during QueryTransactionIDs: %v", err)
+	}
+	return results, nil
+}
+
+func (p *Processor) SetBlockIDForTransactions(trx *sql.Tx, blockID int64, hashes []*chainhash.Hash) error {
+	var sqlParamBuf bytes.Buffer
+	sqlParams := []interface{}{blockID}
+	sql := "UPDATE transactions SET block_id=$1 WHERE hash in (%s)"
+	for idx, h := range hashes {
+		if idx > 0 {
+			io.WriteString(&sqlParamBuf, ",")
+		}
+		io.WriteString(&sqlParamBuf, fmt.Sprintf("$%d", idx+2))
+		sqlParams = append(sqlParams, h.CloneBytes())
 	}
 	sql = fmt.Sprintf(sql, string(sqlParamBuf.Bytes()))
-	sql2 = fmt.Sprintf(sql2, string(sqlParamBuf2.Bytes()))
 	_, err := trx.Exec(sql, sqlParams...)
-	if err != nil {
-		return nil, err
+	return err
+}
+
+func (p *Processor) EnsureTransactionsInserted(trx *sql.Tx, hashes []*chainhash.Hash) error {
+	var sqlParamBuf bytes.Buffer
+	sqlParams := make([]interface{}, 0)
+	sql := "INSERT INTO transactions(hash) VALUES %s ON CONFLICT(hash) DO NOTHING"
+	for idx, h := range hashes {
+		if idx > 0 {
+			io.WriteString(&sqlParamBuf, ",")
+		}
+		io.WriteString(&sqlParamBuf, fmt.Sprintf("($%d)", idx+1))
+		sqlParams = append(sqlParams, h.CloneBytes())
 	}
-	rows, err := trx.Query(sql2, sqlParams...)
+	sql = fmt.Sprintf(sql, string(sqlParamBuf.Bytes()))
+	_, err := trx.Exec(sql, sqlParams...)
+	return err
+}
+
+func (p *Processor) QueryTransactionIDs(trx *sql.Tx, hashes []*chainhash.Hash) (map[string]int64, error) {
+	result := map[string]int64{}
+	var sqlParamBuf bytes.Buffer
+	sqlParams := make([]interface{}, 0)
+	sql := "SELECT id, hash FROM transactions WHERE hash in (%s)"
+	for idx, h := range hashes {
+		if idx > 0 {
+			io.WriteString(&sqlParamBuf, ",")
+		}
+		io.WriteString(&sqlParamBuf, fmt.Sprintf("$%d", idx+1))
+		sqlParams = append(sqlParams, h.CloneBytes())
+	}
+	sql = fmt.Sprintf(sql, string(sqlParamBuf.Bytes()))
+	rows, err := trx.Query(sql, sqlParams...)
 	if err != nil {
 		return nil, err
 	}

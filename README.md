@@ -6,4 +6,7 @@ This is work in progress and lacking documentation
 
 # Donations
 
-If you want to reward this work you can donate Vertcoin to `VnGYRfD65XFab4gE3feJwWVUuaxK7EgFPK` or Bitcoin to `37E56moXYRE2RU9ddXnhu8gTLk7Rqq45eh`
+If you want to reward this work you can donate some coins here:
+
+* Vertcoin : `VnGYRfD65XFab4gE3feJwWVUuaxK7EgFPK` 
+* Bitcoin  : `37E56moXYRE2RU9ddXnhu8gTLk7Rqq45eh`

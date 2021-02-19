@@ -29,7 +29,7 @@ func main() {
 		panic(err)
 	}
 
-	h := http.NewHttpServer(db, p)
+	h := http.NewHttpServer(rpc, db, p)
 
 	go p.ProcessLoop()
 	h.Run()
