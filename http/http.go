@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"os"
+	"runtime"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -24,6 +26,7 @@ type HttpServer struct {
 	rpc           *rpcclient.Client
 	db            *sql.DB
 	proc          *processor.Processor
+	mem           runtime.MemStats
 	responseTimes map[string]*ratecounter.AvgRateCounter
 }
 
@@ -53,8 +56,15 @@ func NewHttpServer(rpc *rpcclient.Client, db *sql.DB, p *processor.Processor) *H
 		"utxos":   ratecounter.NewAvgRateCounter(15 * time.Minute),
 		"balance": ratecounter.NewAvgRateCounter(15 * time.Minute),
 	}
-
+	go h.memstatsLoop()
 	return h
+}
+
+func (h *HttpServer) memstatsLoop() {
+	for {
+		runtime.ReadMemStats(&h.mem)
+		time.Sleep(time.Minute * 5)
+	}
 }
 
 func (h *HttpServer) Run() error {
@@ -76,12 +86,20 @@ func (h *HttpServer) healthHandler(w http.ResponseWriter, r *http.Request) {
 	reply := map[string]interface{}{}
 
 	for k, v := range h.responseTimes {
-		reply[fmt.Sprintf("response_time_%s", k)] = float64(v.Rate()) / float64(math.Pow(10, 6))
-		reply[fmt.Sprintf("rps_last_15m_%s", k)] = float64(v.Hits()) / float64(15*60)
+		reply[fmt.Sprintf("response_time_%s", k)] = roundDecimals(float64(v.Rate())/float64(math.Pow(10, 6)), 3)
+		reply[fmt.Sprintf("rps_last_15m_%s", k)] = roundDecimals(float64(v.Hits())/float64(15*60), 3)
 	}
 
+	reply["mem_alloc_mb"] = (h.mem.Alloc / 1024 / 1024)
+	reply["mem_sys_mb"] = (h.mem.Sys / 1024 / 1024)
+	reply["hostname"], _ = os.Hostname()
 	writeJson(w, reply)
 	h.responseTimes["health"].Incr(time.Since(start).Nanoseconds())
+}
+
+func roundDecimals(v float64, d int) float64 {
+	div := float64(math.Pow10(d))
+	return math.Round(v*div) / div
 }
 
 func (h *HttpServer) balanceHandler(w http.ResponseWriter, r *http.Request) {

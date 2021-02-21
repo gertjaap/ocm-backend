@@ -36,6 +36,9 @@ func (p *Processor) ProcessLoop() {
 	if startHeightStr != "" {
 		startHeight, _ = strconv.ParseInt(startHeightStr, 10, 64)
 	}
+
+	apiOnly := (os.Getenv("OCM_BACKEND_APIONLY") == "1")
+
 	var height int64
 	for {
 		err := p.db.QueryRow("SELECT height FROM blocks ORDER BY height DESC limit 1").Scan(&height)
@@ -61,118 +64,125 @@ func (p *Processor) ProcessLoop() {
 			logging.Debugf("Querying block %d", height+1)
 		}
 
-		start := time.Now()
-		hash, err := p.rpc.GetBlockHash(height + 1)
-		logging.Debugf("GetBlockHash: %d us", time.Now().Sub(start).Microseconds())
-		if err != nil {
-			if strings.Contains(err.Error(), "-8: Block height out of range") {
+		if p.BackendTipHeight >= height+1 {
 
-				// All caught up!
-				if !caughtUp {
-					logging.Infof("Block %d not there yet. All caught up!", height+1)
-					caughtUp = true
+			start := time.Now()
+			hash, err := p.rpc.GetBlockHash(height + 1)
+			logging.Debugf("GetBlockHash: %d us", time.Now().Sub(start).Microseconds())
+			if err != nil {
+				if strings.Contains(err.Error(), "-8: Block height out of range") {
+
+					// All caught up!
+					if !caughtUp {
+						logging.Infof("Block %d not there yet. All caught up!", height+1)
+						caughtUp = true
+					}
+					time.Sleep(time.Second * 1)
+					continue
 				}
+				logging.Warnf("Unable to get block at height %d: %v, retrying in 5 seconds", height+1, err)
+				time.Sleep(time.Second * 5)
+				continue
+			}
+
+			if (height+1)%100 == 0 || caughtUp {
+				logging.Infof("Processing block %d", height+1)
+			} else {
+				logging.Debugf("Processing block %d", height+1)
+			}
+
+			start = time.Now()
+			hdr, err := p.rpc.GetBlockHeader(hash)
+			logging.Debugf("GetBlockHeader: %d us", time.Now().Sub(start).Microseconds())
+			if err != nil {
+				logging.Warnf("Unable to get block header for %s: %v, retrying in 5 seconds", hash.String(), err)
 				time.Sleep(time.Second * 1)
 				continue
 			}
-			logging.Warnf("Unable to get block at height %d: %v, retrying in 5 seconds", height+1, err)
-			time.Sleep(time.Second * 5)
-			continue
-		}
 
-		if (height+1)%100 == 0 || caughtUp {
-			logging.Infof("Processing block %d", height+1)
+			if apiOnly == false {
+				reorg := false
+				if height > startHeight {
+					var b []byte
+					err = p.db.QueryRow("SELECT hash FROM blocks WHERE height=$1", height).Scan(&b)
+					if err != nil {
+						panic(err)
+					}
+					h, err := chainhash.NewHash(b)
+					if err != nil {
+						panic(err)
+					}
+					if !hdr.PrevBlock.IsEqual(h) {
+						reorg = true
+					}
+				}
+
+				if reorg {
+					// Reorg - delete all transactions for that block and reset height
+				} else {
+					// Normal - process
+					start = time.Now()
+					blk, err := p.rpc.GetBlock(hash)
+					logging.Debugf("GetBlock: %d us", time.Now().Sub(start).Microseconds())
+					if err != nil {
+						logging.Warnf("Unable to get block %s: %v, retrying in 5 seconds", hash.String(), err)
+						time.Sleep(time.Second * 1)
+						continue
+					}
+
+					// Start batch
+					tx, err := p.db.Begin()
+
+					var blockID int64
+					bh := blk.BlockHash()
+
+					err = tx.QueryRow("INSERT INTO blocks(hash, height) VALUES ($1,$2) RETURNING id", (&bh).CloneBytes(), height+1).Scan(&blockID)
+					if err != nil {
+						logging.Warnf("Unable to insert block: %v", err)
+						return
+					}
+
+					start = time.Now()
+					txIDs, err := p.GetTransactionIDsForBlock(tx, blockID, blk)
+					if err != nil {
+						logging.Warnf("Unable to query txids for block: %v", height+1, err)
+						return
+					}
+					logging.Debugf("GetTransactionIDsForBlock: %d us", time.Now().Sub(start).Microseconds())
+
+					start = time.Now()
+					scriptIDs, err := p.GetScriptIDsForBlock(tx, blk)
+					if err != nil {
+						logging.Warnf("Unable to query script ids for block: %v", height+1, err)
+						return
+					}
+					logging.Debugf("GetScriptIDsForBlock: %d us", time.Now().Sub(start).Microseconds())
+
+					for i, t := range blk.Transactions {
+						start = time.Now()
+						err = p.processTransaction(tx, blockID, i, txIDs, scriptIDs, t)
+						logging.Debugf("Process TX: %d us", time.Now().Sub(start).Microseconds())
+						if err != nil {
+							logging.Warnf("Unable to process transaction %v: %v", t.TxHash(), err)
+							return
+						}
+					}
+
+					err = tx.Commit()
+					if err != nil {
+						logging.Warnf("Unable to commit block: %v", err)
+						return
+					}
+					logging.Debugf("Processed block %d", height+1)
+				}
+			}
+
+			p.TipHeight = height + 1
+			p.Difficulty = p.BitsToDiff(hdr.Bits)
+			height++
 		} else {
-			logging.Debugf("Processing block %d", height+1)
-		}
-
-		start = time.Now()
-		hdr, err := p.rpc.GetBlockHeader(hash)
-		logging.Debugf("GetBlockHeader: %d us", time.Now().Sub(start).Microseconds())
-		if err != nil {
-			logging.Warnf("Unable to get block header for %s: %v, retrying in 5 seconds", hash.String(), err)
 			time.Sleep(time.Second * 1)
-			continue
 		}
-
-		reorg := false
-		if height > startHeight {
-			var b []byte
-			err = p.db.QueryRow("SELECT hash FROM blocks WHERE height=$1", height).Scan(&b)
-			if err != nil {
-				panic(err)
-			}
-			h, err := chainhash.NewHash(b)
-			if err != nil {
-				panic(err)
-			}
-			if !hdr.PrevBlock.IsEqual(h) {
-				reorg = true
-			}
-		}
-
-		if reorg {
-			// Reorg - delete all transactions for that block and reset height
-		} else {
-			// Normal - process
-			start = time.Now()
-			blk, err := p.rpc.GetBlock(hash)
-			logging.Debugf("GetBlock: %d us", time.Now().Sub(start).Microseconds())
-			if err != nil {
-				logging.Warnf("Unable to get block %s: %v, retrying in 5 seconds", hash.String(), err)
-				time.Sleep(time.Second * 1)
-				continue
-			}
-
-			// Start batch
-			tx, err := p.db.Begin()
-
-			var blockID int64
-			bh := blk.BlockHash()
-
-			err = tx.QueryRow("INSERT INTO blocks(hash, height) VALUES ($1,$2) RETURNING id", (&bh).CloneBytes(), height+1).Scan(&blockID)
-			if err != nil {
-				logging.Warnf("Unable to insert block: %v", err)
-				return
-			}
-
-			start = time.Now()
-			txIDs, err := p.GetTransactionIDsForBlock(tx, blockID, blk)
-			if err != nil {
-				logging.Warnf("Unable to query txids for block: %v", height+1, err)
-				return
-			}
-			logging.Debugf("GetTransactionIDsForBlock: %d us", time.Now().Sub(start).Microseconds())
-
-			start = time.Now()
-			scriptIDs, err := p.GetScriptIDsForBlock(tx, blk)
-			if err != nil {
-				logging.Warnf("Unable to query script ids for block: %v", height+1, err)
-				return
-			}
-			logging.Debugf("GetScriptIDsForBlock: %d us", time.Now().Sub(start).Microseconds())
-
-			for i, t := range blk.Transactions {
-				start = time.Now()
-				err = p.processTransaction(tx, blockID, i, txIDs, scriptIDs, t)
-				logging.Debugf("Process TX: %d us", time.Now().Sub(start).Microseconds())
-				if err != nil {
-					logging.Warnf("Unable to process transaction %v: %v", t.TxHash(), err)
-					return
-				}
-			}
-
-			err = tx.Commit()
-			if err != nil {
-				logging.Warnf("Unable to commit block: %v", err)
-				return
-			}
-			logging.Debugf("Processed block %d", height+1)
-		}
-
-		p.TipHeight = height + 1
-		p.Difficulty = p.BitsToDiff(hdr.Bits)
-		height++
 	}
 }
 
