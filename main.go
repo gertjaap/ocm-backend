@@ -12,7 +12,11 @@ import (
 )
 
 func main() {
-	logging.SetLogLevel(int(logging.LogLevelInfo))
+	if os.Getenv("DEBUG") == "1" {
+		logging.SetLogLevel(int(logging.LogLevelDebug))
+	} else {
+		logging.SetLogLevel(int(logging.LogLevelInfo))
+	}
 	rpc, err := initRPC()
 	if err != nil {
 		panic(err)

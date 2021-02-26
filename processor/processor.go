@@ -102,9 +102,11 @@ func (p *Processor) ProcessLoop() {
 
 			if apiOnly == false {
 				reorg := false
+				var blockID int
 				if height > startHeight {
 					var b []byte
-					err = p.db.QueryRow("SELECT hash FROM blocks WHERE height=$1", height).Scan(&b)
+					logging.Infof("Querying known hash at height %d", height)
+					err = p.db.QueryRow("SELECT hash, id FROM blocks WHERE height=$1", height).Scan(&b, &blockID)
 					if err != nil {
 						panic(err)
 					}
@@ -118,7 +120,45 @@ func (p *Processor) ProcessLoop() {
 				}
 
 				if reorg {
+					logging.Infof("Reorg detected - reverting block %d", height)
 					// Reorg - delete all transactions for that block and reset height
+					tx, err := p.db.Begin()
+					if err != nil {
+						panic(err)
+					}
+
+					logging.Infof("Reorg detected - marking outputs spent in block %d as unspent", height)
+					_, err = tx.Exec("UPDATE outputs SET spent_in_tx=NULL WHERE spent_in_tx IN (SELECT id FROM transactions WHERE block_id=$1)", blockID)
+					if err != nil {
+						panic(err)
+					}
+
+					logging.Infof("Reorg detected - removing outputs created in block %d", height)
+					_, err = tx.Exec("DELETE FROM outputs WHERE created_in_tx IN (SELECT id FROM transactions WHERE block_id=$1)", blockID)
+					if err != nil {
+						panic(err)
+					}
+
+					logging.Infof("Reorg detected - removing transactions from block %d", height)
+					_, err = tx.Exec("DELETE FROM transactions WHERE block_id=$1", blockID)
+					if err != nil {
+						panic(err)
+					}
+
+					logging.Infof("Reorg detected - removing block %d", height)
+					_, err = tx.Exec("DELETE FROM blocks WHERE id=$1", blockID)
+					if err != nil {
+						panic(err)
+					}
+
+					logging.Infof("Reorg detected - committing reversal for block %d", height)
+					err = tx.Commit()
+					if err != nil {
+						panic(err)
+					}
+
+					height--
+
 				} else {
 					// Normal - process
 					start = time.Now()
@@ -174,12 +214,14 @@ func (p *Processor) ProcessLoop() {
 						return
 					}
 					logging.Debugf("Processed block %d", height+1)
+					height++
 				}
+			} else {
+				height++
 			}
 
-			p.TipHeight = height + 1
 			p.Difficulty = p.BitsToDiff(hdr.Bits)
-			height++
+			p.TipHeight = height
 		} else {
 			time.Sleep(time.Second * 1)
 		}
